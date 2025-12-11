@@ -3,15 +3,21 @@ const express = require("express");
 const cors = require("cors");
 const sqlite3 = require("sqlite3").verbose();
 const path = require("path");
+require("dotenv").config();
+
+const {
+  getAddressSummary,
+  getAddressUtxos,
+  submitTx,
+} = require("./blockchainService");
 
 const app = express();
 const PORT = 5000;
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// SQLite database
+// SQLite
 const dbPath = path.resolve(__dirname, "notes.db");
 const db = new sqlite3.Database(dbPath, (err) => {
   if (err) {
@@ -21,7 +27,6 @@ const db = new sqlite3.Database(dbPath, (err) => {
   }
 });
 
-// Create table if not exists
 db.serialize(() => {
   db.run(
     `CREATE TABLE IF NOT EXISTS notes (
@@ -41,57 +46,59 @@ db.serialize(() => {
   );
 });
 
-// Helper to handle DB errors
+// Helper
 const handleDbError = (res, err) => {
   console.error("DB error:", err.message);
   res.status(500).json({ error: "Database error", details: err.message });
 };
 
-// ----- ROUTES -----
+// ========== NOTES CRUD ==========
 
-// GET all notes
 app.get("/api/notes", (req, res) => {
-  const sql = "SELECT * FROM notes ORDER BY created_at DESC";
-  db.all(sql, [], (err, rows) => {
-    if (err) return handleDbError(res, err);
-    res.json(rows);
-  });
+  db.all(
+    "SELECT * FROM notes ORDER BY created_at DESC",
+    [],
+    (err, rows) => {
+      if (err) return handleDbError(res, err);
+      res.json(rows);
+    }
+  );
 });
 
-// GET single note by ID
 app.get("/api/notes/:id", (req, res) => {
-  const sql = "SELECT * FROM notes WHERE id = ?";
-  db.get(sql, [req.params.id], (err, row) => {
-    if (err) return handleDbError(res, err);
-    if (!row) return res.status(404).json({ error: "Note not found" });
-    res.json(row);
-  });
+  db.get(
+    "SELECT * FROM notes WHERE id = ?",
+    [req.params.id],
+    (err, row) => {
+      if (err) return handleDbError(res, err);
+      if (!row) return res.status(404).json({ error: "Note not found" });
+      res.json(row);
+    }
+  );
 });
 
-// CREATE note
 app.post("/api/notes", (req, res) => {
   const { title, content } = req.body;
-
   if (!title || !content) {
     return res.status(400).json({ error: "Title and content are required" });
   }
 
-  const sql =
-    "INSERT INTO notes (title, content, created_at, updated_at) VALUES (?, ?, datetime('now'), datetime('now'))";
-  db.run(sql, [title, content], function (err) {
-    if (err) return handleDbError(res, err);
-
-    res.status(201).json({
-      id: this.lastID,
-      title,
-      content,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    });
-  });
+  db.run(
+    "INSERT INTO notes (title, content, created_at, updated_at) VALUES (?, ?, datetime('now'), datetime('now'))",
+    [title, content],
+    function (err) {
+      if (err) return handleDbError(res, err);
+      res.status(201).json({
+        id: this.lastID,
+        title,
+        content,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+    }
+  );
 });
 
-// UPDATE note
 app.put("/api/notes/:id", (req, res) => {
   const { title, content } = req.body;
   const id = req.params.id;
@@ -100,23 +107,22 @@ app.put("/api/notes/:id", (req, res) => {
     return res.status(400).json({ error: "Title and content are required" });
   }
 
-  const sql =
-    "UPDATE notes SET title = ?, content = ?, updated_at = datetime('now') WHERE id = ?";
-  db.run(sql, [title, content, id], function (err) {
-    if (err) return handleDbError(res, err);
-    if (this.changes === 0) {
-      return res.status(404).json({ error: "Note not found" });
+  db.run(
+    "UPDATE notes SET title = ?, content = ?, updated_at = datetime('now') WHERE id = ?",
+    [title, content, id],
+    function (err) {
+      if (err) return handleDbError(res, err);
+      if (this.changes === 0) {
+        return res.status(404).json({ error: "Note not found" });
+      }
+      res.json({ message: "Note updated successfully" });
     }
-    res.json({ message: "Note updated successfully" });
-  });
+  );
 });
 
-// DELETE note
 app.delete("/api/notes/:id", (req, res) => {
   const id = req.params.id;
-  const sql = "DELETE FROM notes WHERE id = ?";
-
-  db.run(sql, [id], function (err) {
+  db.run("DELETE FROM notes WHERE id = ?", [id], function (err) {
     if (err) return handleDbError(res, err);
     if (this.changes === 0) {
       return res.status(404).json({ error: "Note not found" });
@@ -125,7 +131,47 @@ app.delete("/api/notes/:id", (req, res) => {
   });
 });
 
-// Start server
+
+// ========== BLOCKCHAIN INTEGRATION ==========
+
+// Wallet summary (ADA + utxos) via Blockfrost
+app.get("/api/wallet/:address/summary", async (req, res) => {
+  try {
+    const summary = await getAddressSummary(req.params.address);
+    res.json(summary);
+  } catch (err) {
+    console.error("Blockfrost summary error:", err);
+    res.status(500).json({ error: "Failed to fetch wallet summary" });
+  }
+});
+
+// UTxOs (raw) for building tx on frontend
+app.get("/api/wallet/:address/utxos", async (req, res) => {
+  try {
+    const utxos = await getAddressUtxos(req.params.address);
+    res.json(utxos);
+  } catch (err) {
+    console.error("Blockfrost utxos error:", err);
+    res.status(500).json({ error: "Failed to fetch UTxOs" });
+  }
+});
+
+// Submit signed tx from frontend (hex string)
+app.post("/api/tx/submit", async (req, res) => {
+  try {
+    const { signedTxHex } = req.body;
+    if (!signedTxHex) {
+      return res.status(400).json({ error: "signedTxHex is required" });
+    }
+
+    const txHash = await submitTx(signedTxHex);
+    res.json({ txHash });
+  } catch (err) {
+    console.error("Blockfrost submit error:", err);
+    res.status(500).json({ error: "Failed to submit transaction" });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
 });
